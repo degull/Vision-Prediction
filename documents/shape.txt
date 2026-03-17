@@ -1,0 +1,15 @@
+입력: [B, T, 3, H, W]
+
+backbone: ConvNeXt V2
+
+backbone 출력 pooled feature: [B, T, C]
+
+temporal encoder 출력:
+
+sequence feature: [B, T, D]
+
+clip summary: [B, D]
+
+multi-future predictor 출력: [B, K, D_f]
+
+event head 출력: [B, K, num_event_classes]

@@ -1,0 +1,26 @@
+1. train_temporal_event.py
+    [1] backbone
+    [2] transformer + volterra
+    [3] 2-scale temporal mamba
+    [4] event head
+→ precision = 0.9806
+→ recall = 0.9538
+→ F1 = 0.9670
+
+▶ ConvNeXt V2
+→ transformer + volterra
+→ 2-scale temporal mamba
+
+output : temporal representation z ∈ R^(B,768)
+backbone_ckpt = r"C:\Users\IIPL02\Desktop\Vision Prediction\checkpoints\temporal_crossing_mamba2scale\best_epoch_002_valF1_0.9670_valAcc_0.9569.pth"
+# -----------------------------------------------------#
+
+2. train_multi_future_decision.py
+
+Temporal Feature z (z∈RB×D)
+        ↓
+Shared Future Encoder
+        ↓
+K Future Branches
+        ↓
+Branch-wise Event Predictor
