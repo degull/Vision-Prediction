@@ -15,7 +15,17 @@ output : temporal representation z ∈ R^(B,768)
 backbone_ckpt = r"C:\Users\IIPL02\Desktop\Vision Prediction\checkpoints\temporal_crossing_mamba2scale\best_epoch_002_valF1_0.9670_valAcc_0.9569.pth"
 # -----------------------------------------------------#
 
-2. train_multi_future_decision.py
+데이터 누수가 있는지 확인
+정확히 같은 clip/video_path가 train/val에 동시에 있는지
+
+같은 원본 video id(시퀀스)가 train/val에 동시에 섞였는지
+
+같은 pedestrian id가 train/val에 동시에 섞였는지
+check_temporal_event_leakage.py
+
+# -----------------------------------------------------#
+2. model/multi_future_stage2.py (ok)
+2. train_multi_future_stage2.py
 
 Temporal Feature z (z∈RB×D)
         ↓
