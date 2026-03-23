@@ -1,4 +1,4 @@
-# C:\Users\IIPL02\Desktop\Vision Prediction\datasets\jaad_video_dataset.py
+# C:\Users\IIPL02\Desktop\Vision Prediction\datasets\jaad_crossing_clip_context_dataset.py
 import os
 import re
 import cv2
@@ -9,17 +9,23 @@ from PIL import Image
 from torchvision import transforms
 
 
-class JAADVideoDataset(Dataset):
+class JAADCrossingClipContextDataset(Dataset):
     """
-    JAAD video dataset with:
-      - crossing label
-      - structured context vectors
+    JAAD clip-level dataset for Stage2.
+
+    Added:
+      - cache for prebuilt clip metadata
+      - optional cache refresh
+      - much faster re-runs after first build
 
     Returns:
         {
             "video": Tensor [T, 3, H, W],
             "video_path": str,
             "video_id": str,
+            "clip_start": int,
+            "clip_end": int,
+            "frame_indices": LongTensor [T],
             "crossing_label": Tensor scalar float,
 
             "attr_vec": Tensor [6],
@@ -40,10 +46,13 @@ class JAADVideoDataset(Dataset):
         num_frames: int = 8,
         image_size: int = 224,
         frame_stride: int = 1,
-        sample_stride: int = 1,
+        sample_stride: int = 2,
         early_horizon: int = 30,
         verbose: bool = False,
         stride: int = None,   # backward compatibility
+        use_cache: bool = True,
+        rebuild_cache: bool = False,
+        cache_dir: str = None,
         **kwargs,
     ):
         self.clips_dir = clips_dir
@@ -58,6 +67,12 @@ class JAADVideoDataset(Dataset):
         self.sample_stride = sample_stride
         self.early_horizon = early_horizon
         self.verbose = verbose
+
+        self.use_cache = use_cache
+        self.rebuild_cache = rebuild_cache
+        self.cache_dir = cache_dir if cache_dir is not None else clips_dir
+
+        os.makedirs(self.cache_dir, exist_ok=True)
 
         self.video_files = sorted([
             os.path.join(clips_dir, f)
@@ -77,44 +92,29 @@ class JAADVideoDataset(Dataset):
             )
         ])
 
-        # preload samples
+        self.cache_path = self._build_cache_path()
         self.samples = []
-        skipped = []
+        self.skipped_videos = []
 
-        for video_path in self.video_files:
-            video_id = os.path.splitext(os.path.basename(video_path))[0]
-            crossing_label = self._load_crossing_label(video_id)
-
-            if crossing_label is None:
-                skipped.append(video_path)
-                continue
-
-            attr_vec = self._load_attr_vector(video_id)
-            app_vec = self._load_app_vector(video_id)
-            traffic_vec = self._load_traffic_vector(video_id)
-            vehicle_vec = self._load_vehicle_vector(video_id)
-
-            self.samples.append({
-                "video_path": video_path,
-                "video_id": video_id,
-                "crossing_label": float(crossing_label),
-                "attr_vec": attr_vec,
-                "app_vec": app_vec,
-                "traffic_vec": traffic_vec,
-                "vehicle_vec": vehicle_vec,
-            })
+        if self.use_cache and (not self.rebuild_cache) and os.path.exists(self.cache_path):
+            self._load_cache()
+        else:
+            self._build_samples_from_scratch()
+            if self.use_cache:
+                self._save_cache()
 
         if len(self.samples) == 0:
             raise RuntimeError(
-                "No labeled samples found from JAAD annotations.\n"
-                "Please inspect XML files to confirm where the crossing label is stored."
+                "No labeled clip samples found from JAAD annotations.\n"
+                "Please inspect XML files and clip videos."
             )
 
         if verbose:
             pos = sum(int(s["crossing_label"] == 1.0) for s in self.samples)
             neg = sum(int(s["crossing_label"] == 0.0) for s in self.samples)
+            unique_videos = len(set(s["video_id"] for s in self.samples))
 
-            print("[JAADVideoDataset]")
+            print("[JAADCrossingClipContextDataset]")
             print(f"  clips_dir       : {self.clips_dir}")
             print(f"  annotations_dir : {self.annotations_dir}")
             print(f"  attributes_dir  : {self.attributes_dir}")
@@ -124,50 +124,192 @@ class JAADVideoDataset(Dataset):
             print(f"  num_frames      : {self.num_frames}")
             print(f"  frame_stride    : {self.frame_stride}")
             print(f"  sample_stride   : {self.sample_stride}")
+            print(f"  total videos    : {unique_videos}")
             print(f"  total samples   : {len(self.samples)}")
             print(f"  positive        : {pos}")
             print(f"  negative        : {neg}")
-            if len(skipped) > 0:
-                print(f"  skipped         : {len(skipped)}")
+            print(f"  skipped videos  : {len(self.skipped_videos)}")
+            print(f"  cache_path      : {self.cache_path}")
+            print(f"  cache_used      : {self.use_cache and os.path.exists(self.cache_path)}")
 
     def __len__(self):
         return len(self.samples)
 
     # ============================================================
+    # Cache
+    # ============================================================
+    def _build_cache_path(self):
+        clips_name = os.path.basename(os.path.normpath(self.clips_dir))
+        cache_name = (
+            f"jaad_clip_context_cache_"
+            f"{clips_name}_"
+            f"nf{self.num_frames}_"
+            f"fs{self.frame_stride}_"
+            f"ss{self.sample_stride}.pt"
+        )
+        return os.path.join(self.cache_dir, cache_name)
+
+    def _save_cache(self):
+        cache_obj = {
+            "samples": self.samples,
+            "skipped_videos": self.skipped_videos,
+            "meta": {
+                "clips_dir": self.clips_dir,
+                "annotations_dir": self.annotations_dir,
+                "attributes_dir": self.attributes_dir,
+                "appearance_dir": self.appearance_dir,
+                "traffic_dir": self.traffic_dir,
+                "vehicle_dir": self.vehicle_dir,
+                "num_frames": self.num_frames,
+                "frame_stride": self.frame_stride,
+                "sample_stride": self.sample_stride,
+                "early_horizon": self.early_horizon,
+            }
+        }
+        torch.save(cache_obj, self.cache_path)
+        if self.verbose:
+            print(f"[Cache Saved] {self.cache_path}")
+
+    def _load_cache(self):
+        cache_obj = torch.load(self.cache_path, map_location="cpu")
+        self.samples = cache_obj["samples"]
+        self.skipped_videos = cache_obj.get("skipped_videos", [])
+        if self.verbose:
+            print(f"[Cache Loaded] {self.cache_path}")
+            print(f"  cached samples  : {len(self.samples)}")
+            print(f"  skipped videos  : {len(self.skipped_videos)}")
+
+    def _build_samples_from_scratch(self):
+        if self.verbose:
+            print("[Cache Miss] Building dataset from scratch...")
+
+        skipped = []
+        samples = []
+
+        for video_path in self.video_files:
+            video_id = os.path.splitext(os.path.basename(video_path))[0]
+            crossing_label = self._load_crossing_label(video_id)
+
+            if crossing_label is None:
+                skipped.append(video_path)
+                continue
+
+            num_total_frames = self._get_num_frames(video_path)
+            if num_total_frames <= 0:
+                skipped.append(video_path)
+                continue
+
+            attr_vec = self._load_attr_vector(video_id)
+            app_vec = self._load_app_vector(video_id)
+            traffic_vec = self._load_traffic_vector(video_id)
+            vehicle_vec = self._load_vehicle_vector(video_id)
+
+            frame_indices_list = self._build_clip_frame_indices(num_total_frames)
+
+            if len(frame_indices_list) == 0:
+                skipped.append(video_path)
+                continue
+
+            for frame_indices in frame_indices_list:
+                clip_start = int(frame_indices[0].item())
+                clip_end = int(frame_indices[-1].item())
+
+                samples.append({
+                    "video_path": video_path,
+                    "video_id": video_id,
+                    "crossing_label": float(crossing_label),
+                    "clip_start": clip_start,
+                    "clip_end": clip_end,
+                    "frame_indices": frame_indices.clone().long(),
+                    "attr_vec": attr_vec.clone().float(),
+                    "app_vec": app_vec.clone().float(),
+                    "traffic_vec": traffic_vec.clone().float(),
+                    "vehicle_vec": vehicle_vec.clone().float(),
+                })
+
+        self.samples = samples
+        self.skipped_videos = skipped
+
+    # ============================================================
+    # Clip construction
+    # ============================================================
+    def _get_num_frames(self, video_path):
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return 0
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        return max(frame_count, 0)
+
+    def _build_clip_frame_indices(self, num_total_frames):
+        needed = 1 + (self.num_frames - 1) * self.frame_stride
+        frame_indices_list = []
+
+        if num_total_frames <= 0:
+            return frame_indices_list
+
+        if num_total_frames < needed:
+            indices = list(range(0, num_total_frames, self.frame_stride))
+            if len(indices) == 0:
+                indices = [0]
+            while len(indices) < self.num_frames:
+                indices.append(indices[-1])
+            indices = indices[:self.num_frames]
+            frame_indices_list.append(torch.tensor(indices, dtype=torch.long))
+            return frame_indices_list
+
+        max_start = num_total_frames - needed
+        start_positions = list(range(0, max_start + 1, self.sample_stride))
+
+        if len(start_positions) == 0 or start_positions[-1] != max_start:
+            start_positions.append(max_start)
+
+        for start in start_positions:
+            indices = [start + i * self.frame_stride for i in range(self.num_frames)]
+            frame_indices_list.append(torch.tensor(indices, dtype=torch.long))
+
+        return frame_indices_list
+
+    # ============================================================
     # Video loading
     # ============================================================
-    def _read_video_frames(self, video_path):
+    def _read_clip_frames(self, video_path, frame_indices):
         cap = cv2.VideoCapture(video_path)
-        frames = []
+        if not cap.isOpened():
+            raise ValueError(f"Failed to open video: {video_path}")
 
-        while True:
+        images = []
+        last_valid = None
+
+        for idx in frame_indices.tolist():
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(idx))
             ret, frame = cap.read()
-            if not ret:
-                break
 
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame = Image.fromarray(frame)
-            frames.append(frame)
+            if ret:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                img = Image.fromarray(frame)
+                last_valid = img
+                images.append(img)
+            else:
+                if last_valid is None:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ret0, frame0 = cap.read()
+                    if not ret0:
+                        cap.release()
+                        raise ValueError(f"Video has no readable frames: {video_path}")
+                    frame0 = cv2.cvtColor(frame0, cv2.COLOR_BGR2RGB)
+                    last_valid = Image.fromarray(frame0)
+                images.append(last_valid)
 
         cap.release()
-        return frames
 
-    def _sample_frames(self, frames):
-        needed = 1 + (self.num_frames - 1) * self.frame_stride
+        while len(images) < self.num_frames:
+            images.append(images[-1])
 
-        if len(frames) >= needed:
-            selected = frames[:needed:self.frame_stride]
-        else:
-            selected = frames[::self.frame_stride]
-            if len(selected) == 0:
-                raise ValueError("No frames sampled from video.")
-            while len(selected) < self.num_frames:
-                selected.append(selected[-1])
+        if len(images) > self.num_frames:
+            images = images[:self.num_frames]
 
-        if len(selected) > self.num_frames:
-            selected = selected[:self.num_frames]
-
-        return selected
+        return images
 
     # ============================================================
     # XML path helpers
@@ -203,7 +345,7 @@ class JAADVideoDataset(Dataset):
         return None, None
 
     # ============================================================
-    # Label extraction
+    # Stage1 label extraction
     # ============================================================
     def _safe_int01(self, value):
         if value is None:
@@ -236,14 +378,12 @@ class JAADVideoDataset(Dataset):
             "pedestrian_crossing",
         ]
 
-        # attributes
         for key in candidate_keys:
             if key in elem.attrib:
                 value = self._safe_int01(elem.attrib.get(key))
                 if value is not None:
                     return value
 
-        # child tags
         for child in elem:
             tag = child.tag.lower()
             text = child.text.strip() if child.text is not None else None
@@ -267,7 +407,6 @@ class JAADVideoDataset(Dataset):
             ]
         )
 
-        # fallback to attributes if main annotation did not contain label
         xml_paths += self._candidate_xml_paths(
             video_id=video_id,
             folder=self.attributes_dir,
@@ -303,7 +442,10 @@ class JAADVideoDataset(Dataset):
                     return value
 
         if self.verbose:
-            print(f"[Label Not Found] {video_id}")
+            print(
+                f"[Crossing Label Not Found] video_id={video_id} | "
+                f"xml={xml_paths[0] if len(xml_paths) > 0 else 'None'}"
+            )
 
         return None
 
@@ -331,11 +473,6 @@ class JAADVideoDataset(Dataset):
         return None
 
     def _collect_xml_fields(self, root):
-        """
-        Flatten XML into key -> list[str] dictionary.
-        This is intentionally generic because exact JAAD sub-annotation
-        field names may vary.
-        """
         fields = {}
 
         def add_value(key, value):
@@ -348,13 +485,11 @@ class JAADVideoDataset(Dataset):
         for elem in root.iter():
             tag = self._normalize_text(elem.tag)
 
-            # element text
             if elem.text is not None:
                 txt = self._normalize_text(elem.text)
                 if txt not in [None, ""]:
                     add_value(tag, txt)
 
-            # attributes
             for k, v in elem.attrib.items():
                 add_value(k, v)
                 if tag is not None:
@@ -414,16 +549,6 @@ class JAADVideoDataset(Dataset):
     # Context vector parsers
     # ============================================================
     def _load_attr_vector(self, video_id):
-        """
-        attr_vec shape [6]
-        Suggested semantics:
-          0: crossing_intent
-          1: walking
-          2: standing
-          3: looking
-          4: moving
-          5: near curb / road boundary
-        """
         root = self._load_context_root(
             video_id,
             self.attributes_dir,
@@ -447,15 +572,6 @@ class JAADVideoDataset(Dataset):
         return torch.tensor(vec, dtype=torch.float32)
 
     def _load_app_vector(self, video_id):
-        """
-        app_vec shape [5]
-        Suggested semantics:
-          0: facing road / front
-          1: left orientation
-          2: right orientation
-          3: visible ratio / visibility
-          4: occlusion
-        """
         root = self._load_context_root(
             video_id,
             self.appearance_dir,
@@ -486,16 +602,6 @@ class JAADVideoDataset(Dataset):
         return torch.tensor(vec, dtype=torch.float32)
 
     def _load_traffic_vector(self, video_id):
-        """
-        traffic_vec shape [6]
-        Suggested semantics:
-          0: crosswalk present
-          1: signal red
-          2: signal green
-          3: signal absent/unknown
-          4: dense traffic
-          5: intersection/junction
-        """
         root = self._load_context_root(
             video_id,
             self.traffic_dir,
@@ -519,16 +625,6 @@ class JAADVideoDataset(Dataset):
         return torch.tensor(vec, dtype=torch.float32)
 
     def _load_vehicle_vector(self, video_id):
-        """
-        vehicle_vec shape [6]
-        Suggested semantics:
-          0: vehicle count normalized
-          1: closest distance normalized (inverse-like proxy if needed)
-          2: approaching vehicle
-          3: vehicle on left
-          4: vehicle on right
-          5: vehicle in front
-        """
         root = self._load_context_root(
             video_id,
             self.vehicle_dir,
@@ -567,26 +663,61 @@ class JAADVideoDataset(Dataset):
     # ============================================================
     def __getitem__(self, idx):
         sample = self.samples[idx]
+
         video_path = sample["video_path"]
         video_id = sample["video_id"]
         label = sample["crossing_label"]
+        clip_start = sample["clip_start"]
+        clip_end = sample["clip_end"]
+        frame_indices = sample["frame_indices"]
 
-        frames = self._read_video_frames(video_path)
+        frames = self._read_clip_frames(video_path, frame_indices)
         if len(frames) == 0:
-            raise ValueError(f"Video has no readable frames: {video_path}")
+            raise ValueError(f"Video clip has no readable frames: {video_path}")
 
-        selected = self._sample_frames(frames)
-        selected = [self.transform(img) for img in selected]
-        video = torch.stack(selected, dim=0)   # [T, 3, H, W]
+        video = torch.stack([self.transform(img) for img in frames], dim=0)
 
         return {
             "video": video,
             "video_path": video_path,
             "video_id": video_id,
+            "clip_start": clip_start,
+            "clip_end": clip_end,
+            "frame_indices": frame_indices.clone().long(),
             "crossing_label": torch.tensor(label, dtype=torch.float32),
-
             "attr_vec": sample["attr_vec"].clone().float(),
             "app_vec": sample["app_vec"].clone().float(),
             "traffic_vec": sample["traffic_vec"].clone().float(),
             "vehicle_vec": sample["vehicle_vec"].clone().float(),
         }
+
+
+if __name__ == "__main__":
+    dataset = JAADCrossingClipContextDataset(
+        clips_dir=r"C:\Users\IIPL02\Desktop\Vision Prediction\data\JAAD\JAAD clips",
+        annotations_dir=r"C:\Users\IIPL02\Desktop\Vision Prediction\data\JAAD\JAAD annotations\annotations",
+        attributes_dir=r"C:\Users\IIPL02\Desktop\Vision Prediction\data\JAAD\JAAD annotations\annotations_attributes",
+        appearance_dir=r"C:\Users\IIPL02\Desktop\Vision Prediction\data\JAAD\JAAD annotations\annotations_appearance",
+        traffic_dir=r"C:\Users\IIPL02\Desktop\Vision Prediction\data\JAAD\JAAD annotations\annotations_traffic",
+        vehicle_dir=r"C:\Users\IIPL02\Desktop\Vision Prediction\data\JAAD\JAAD annotations\annotations_vehicle",
+        num_frames=8,
+        image_size=224,
+        frame_stride=1,
+        sample_stride=2,
+        verbose=True,
+        use_cache=True,
+        rebuild_cache=False,
+    )
+
+    sample = dataset[0]
+    print("\n[Smoke Test]")
+    print("video           :", tuple(sample["video"].shape))
+    print("video_id        :", sample["video_id"])
+    print("clip_start      :", sample["clip_start"])
+    print("clip_end        :", sample["clip_end"])
+    print("frame_indices   :", sample["frame_indices"].tolist())
+    print("crossing_label  :", float(sample["crossing_label"].item()))
+    print("attr_vec        :", tuple(sample["attr_vec"].shape))
+    print("app_vec         :", tuple(sample["app_vec"].shape))
+    print("traffic_vec     :", tuple(sample["traffic_vec"].shape))
+    print("vehicle_vec     :", tuple(sample["vehicle_vec"].shape))

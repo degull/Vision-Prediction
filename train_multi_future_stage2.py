@@ -1,3 +1,4 @@
+# C:\Users\IIPL02\Desktop\Vision Prediction\train_multi_future_stage2.py
 import os
 import csv
 import time
@@ -11,7 +12,7 @@ import torch
 from torch.utils.data import DataLoader, random_split, WeightedRandomSampler
 
 from models.multi_future_stage2 import (
-    MultiFutureStage2Model,
+    ContextExpertStage2Model,
     compute_stage2_losses,
 )
 
@@ -46,13 +47,23 @@ def print_trainable_modules(model):
     print()
 
 
+def build_optimizer(model, lr, weight_decay):
+    return torch.optim.AdamW(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=lr,
+        weight_decay=weight_decay,
+    )
+
+
 # ============================================================
 # Dataset Resolver
 # ============================================================
 def resolve_dataset_class():
     candidates = [
-        ("datasets.jaad_video_dataset", ["JAADVideoDataset"]),
-        ("jaad_video_dataset", ["JAADVideoDataset"]),
+        ("datasets.jaad_crossing_clip_context_dataset", ["JAADCrossingClipContextDataset"]),
+        ("jaad_crossing_clip_context_dataset", ["JAADCrossingClipContextDataset"]),
+        ("datasets.jaad_video_dataset", ["JAADVideoDataset"]),  # fallback
+        ("jaad_video_dataset", ["JAADVideoDataset"]),           # fallback
     ]
 
     errors = []
@@ -83,6 +94,9 @@ def build_dataset(dataset_cls, args):
         "clips_dir": args.clips_dir,
         "annotations_dir": args.annotations_dir,
         "attributes_dir": args.attributes_dir,
+        "appearance_dir": args.appearance_dir,
+        "traffic_dir": args.traffic_dir,
+        "vehicle_dir": args.vehicle_dir,
         "num_frames": args.num_frames,
         "image_size": args.image_size,
         "frame_stride": args.frame_stride,
@@ -101,43 +115,35 @@ def build_dataset(dataset_cls, args):
     return dataset_cls(**final_kwargs)
 
 
-def infer_video_and_label_keys(sample):
+def infer_keys(sample):
     if not isinstance(sample, dict):
         raise TypeError("Dataset sample must be dict.")
 
-    video_key_candidates = ["video", "frames", "clip", "images"]
-    label_key_candidates = [
+    required_keys = [
+        "video",
         "crossing_label",
-        "crossing",
-        "label",
-        "target",
-        "y",
-        "event_label",
-        "crossing_target",
-        "pedestrian_crossing",
+        "attr_vec",
+        "app_vec",
+        "traffic_vec",
+        "vehicle_vec",
     ]
+    for k in required_keys:
+        if k not in sample:
+            raise KeyError(f"Required key '{k}' not found in sample keys: {list(sample.keys())}")
 
-    video_key = None
-    label_key = None
+    print("[Detected Sample Keys]")
+    for k in sample.keys():
+        print(f"  {k}")
+    print()
 
-    for k in video_key_candidates:
-        if k in sample:
-            video_key = k
-            break
-
-    for k in label_key_candidates:
-        if k in sample:
-            label_key = k
-            break
-
-    if video_key is None:
-        raise KeyError(f"Could not infer video key from sample keys: {list(sample.keys())}")
-
-    if label_key is None:
-        raise KeyError(f"Could not infer label key from sample keys: {list(sample.keys())}")
-
-    print(f"[Detected Sample Keys] video_key={video_key} | label_key={label_key}")
-    return video_key, label_key
+    return {
+        "video_key": "video",
+        "label_key": "crossing_label",
+        "attr_key": "attr_vec",
+        "app_key": "app_vec",
+        "traffic_key": "traffic_vec",
+        "vehicle_key": "vehicle_vec",
+    }
 
 
 def get_subset_label_stats(subset, label_key):
@@ -180,6 +186,12 @@ def build_weighted_sampler(subset, label_key):
         replacement=True,
     )
     return sampler
+
+
+def compute_dataset_pos_weight(pos_count, neg_count, max_pos_weight=10.0):
+    pos_weight = float(neg_count) / max(float(pos_count), 1.0)
+    pos_weight = max(1e-6, min(pos_weight, max_pos_weight))
+    return pos_weight
 
 
 # ============================================================
@@ -266,7 +278,7 @@ def save_checkpoint(save_path, epoch, model, optimizer, train_metrics, val_metri
     ckpt = {
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict() if optimizer is not None else None,
         "train_metrics": train_metrics,
         "val_metrics": val_metrics,
         "args": vars(args),
@@ -314,16 +326,18 @@ def run_one_epoch(
     device,
     epoch,
     total_epochs,
-    video_key,
-    label_key,
+    keys,
     threshold,
+    pos_weight,
     log_prefix="Train",
     train_mode=True,
     lambda_final=1.0,
-    lambda_branch=0.05,
-    lambda_balance=0.01,
-    lambda_div=0.005,
-    lambda_distill=1.0,
+    lambda_branch=0.1,
+    lambda_distill=0.3,
+    lambda_gate_balance=0.01,
+    lambda_div=0.02,
+    lambda_margin=0.01,
+    lambda_risk_reg=0.01,
     log_interval=50,
 ):
     if train_mode:
@@ -334,13 +348,17 @@ def run_one_epoch(
     total_loss_meter = AverageMeter()
     final_loss_meter = AverageMeter()
     branch_loss_meter = AverageMeter()
-    balance_loss_meter = AverageMeter()
-    div_loss_meter = AverageMeter()
     distill_loss_meter = AverageMeter()
+    gate_balance_meter = AverageMeter()
+    div_meter = AverageMeter()
+    margin_meter = AverageMeter()
+    risk_reg_meter = AverageMeter()
 
     all_logits = []
     all_labels = []
-    branch_usage_hard = torch.zeros(model.num_branches, dtype=torch.long)
+    gate_usage_sum = torch.zeros(2, dtype=torch.float64)
+    gate_usage_count = 0
+    branch_usage_hard = torch.zeros(2, dtype=torch.long)
 
     start_time = time.time()
     num_batches = len(loader)
@@ -348,18 +366,27 @@ def run_one_epoch(
     context = torch.enable_grad() if train_mode else torch.no_grad()
     with context:
         for batch_idx, batch in enumerate(loader, start=1):
-            video = batch[video_key].to(device, non_blocking=True)
-            labels = batch[label_key].float().to(device, non_blocking=True).view(-1, 1)
+            video = batch[keys["video_key"]].to(device, non_blocking=True)
+            labels = batch[keys["label_key"]].float().to(device, non_blocking=True).view(-1, 1)
 
-            outputs = model(video)
+            attr_vec = batch[keys["attr_key"]].float().to(device, non_blocking=True)
+            app_vec = batch[keys["app_key"]].float().to(device, non_blocking=True)
+            traffic_vec = batch[keys["traffic_key"]].float().to(device, non_blocking=True)
+            vehicle_vec = batch[keys["vehicle_key"]].float().to(device, non_blocking=True)
+
+            outputs = model(video, attr_vec, app_vec, traffic_vec, vehicle_vec)
             losses = compute_stage2_losses(
                 outputs=outputs,
                 labels=labels,
+                pos_weight=pos_weight,
+                sample_weight=None,
                 lambda_final=lambda_final,
                 lambda_branch=lambda_branch,
-                lambda_balance=lambda_balance,
-                lambda_div=lambda_div,
                 lambda_distill=lambda_distill,
+                lambda_gate_balance=lambda_gate_balance,
+                lambda_div=lambda_div,
+                lambda_margin=lambda_margin,
+                lambda_risk_reg=lambda_risk_reg,
             )
 
             total_loss = losses["total"]
@@ -371,21 +398,26 @@ def run_one_epoch(
                 optimizer.step()
 
             final_logit = outputs["final_logit"]
-            branch_conf = outputs["branch_conf"]
+            gate_weights = outputs["gate_weights"]
 
             bs = video.size(0)
 
             total_loss_meter.update(total_loss.item(), bs)
             final_loss_meter.update(losses["final"].item(), bs)
             branch_loss_meter.update(losses["branch"].item(), bs)
-            balance_loss_meter.update(losses["balance"].item(), bs)
-            div_loss_meter.update(losses["div"].item(), bs)
             distill_loss_meter.update(losses["distill"].item(), bs)
+            gate_balance_meter.update(losses["gate_balance"].item(), bs)
+            div_meter.update(losses["div"].item(), bs)
+            margin_meter.update(losses["margin"].item(), bs)
+            risk_reg_meter.update(losses["risk_reg"].item(), bs)
 
             all_logits.append(final_logit.detach().cpu())
             all_labels.append(labels.detach().cpu())
 
-            best_branch = branch_conf.detach().cpu().argmax(dim=1)
+            gate_usage_sum += gate_weights.detach().cpu().sum(dim=0).double()
+            gate_usage_count += gate_weights.size(0)
+
+            best_branch = gate_weights.detach().cpu().argmax(dim=1)
             for idx in best_branch.tolist():
                 branch_usage_hard[idx] += 1
 
@@ -402,8 +434,8 @@ def run_one_epoch(
                     threshold=threshold,
                 )
 
-                usage_mean = branch_conf.detach().cpu().mean(dim=0).tolist()
-                usage_str = "[" + ", ".join([f"{u:.3f}" for u in usage_mean]) + "]"
+                mean_gate = (gate_usage_sum / max(gate_usage_count, 1)).tolist()
+                gate_str = "[" + ", ".join([f"{g:.3f}" for g in mean_gate]) + "]"
 
                 print(
                     f"\r[{log_prefix}] Epoch {epoch:03d}/{total_epochs:03d} | "
@@ -411,9 +443,11 @@ def run_one_epoch(
                     f"Loss {total_loss_meter.avg:.4f} | "
                     f"Final {final_loss_meter.avg:.4f} | "
                     f"Branch {branch_loss_meter.avg:.4f} | "
-                    f"Balance {balance_loss_meter.avg:.4f} | "
-                    f"Div {div_loss_meter.avg:.4f} | "
                     f"Distill {distill_loss_meter.avg:.4f} | "
+                    f"GateBal {gate_balance_meter.avg:.4f} | "
+                    f"Div {div_meter.avg:.4f} | "
+                    f"Margin {margin_meter.avg:.4f} | "
+                    f"RiskReg {risk_reg_meter.avg:.4f} | "
                     f"Acc {batch_metrics['acc']:.4f} | "
                     f"BalAcc {batch_metrics['balanced_acc']:.4f} | "
                     f"Prec {batch_metrics['precision']:.4f} | "
@@ -424,7 +458,7 @@ def run_one_epoch(
                     f"TN {batch_metrics['tn']} | "
                     f"FP {batch_metrics['fp']} | "
                     f"FN {batch_metrics['fn']} | "
-                    f"BranchConf {usage_str} | "
+                    f"Gate {gate_str} | "
                     f"ETA {format_seconds(eta)}",
                     end=""
                 )
@@ -440,10 +474,14 @@ def run_one_epoch(
     metrics["loss"] = total_loss_meter.avg
     metrics["final_loss"] = final_loss_meter.avg
     metrics["branch_loss"] = branch_loss_meter.avg
-    metrics["balance_loss"] = balance_loss_meter.avg
-    metrics["div_loss"] = div_loss_meter.avg
     metrics["distill_loss"] = distill_loss_meter.avg
+    metrics["gate_balance_loss"] = gate_balance_meter.avg
+    metrics["div_loss"] = div_meter.avg
+    metrics["margin_loss"] = margin_meter.avg
+    metrics["risk_reg_loss"] = risk_reg_meter.avg
+    metrics["gate_mean"] = (gate_usage_sum / max(gate_usage_count, 1)).tolist()
     metrics["branch_usage"] = branch_usage_hard.tolist()
+
     metrics["best_threshold"] = best_thr
     metrics["best_thr_acc"] = best_thr_metrics["acc"]
     metrics["best_thr_precision"] = best_thr_metrics["precision"]
@@ -486,6 +524,21 @@ def main():
         type=str,
         default=r"C:\Users\IIPL02\Desktop\Vision Prediction\data\JAAD\JAAD annotations\annotations_attributes"
     )
+    parser.add_argument(
+        "--appearance_dir",
+        type=str,
+        default=r"C:\Users\IIPL02\Desktop\Vision Prediction\data\JAAD\JAAD annotations\annotations_appearance"
+    )
+    parser.add_argument(
+        "--traffic_dir",
+        type=str,
+        default=r"C:\Users\IIPL02\Desktop\Vision Prediction\data\JAAD\JAAD annotations\annotations_traffic"
+    )
+    parser.add_argument(
+        "--vehicle_dir",
+        type=str,
+        default=r"C:\Users\IIPL02\Desktop\Vision Prediction\data\JAAD\JAAD annotations\annotations_vehicle"
+    )
 
     parser.add_argument("--num_frames", type=int, default=8)
     parser.add_argument("--image_size", type=int, default=224)
@@ -501,32 +554,44 @@ def main():
     parser.add_argument("--val_ratio", type=float, default=0.2)
 
     parser.add_argument("--stage1_feat_dim", type=int, default=768)
-    parser.add_argument("--adapter_hidden_dim", type=int, default=256)
-    parser.add_argument("--future_dim", type=int, default=128)
-    parser.add_argument("--shared_hidden_dim", type=int, default=128)
-    parser.add_argument("--branch_hidden_dim", type=int, default=128)
-    parser.add_argument("--num_branches", type=int, default=2)
+
+    parser.add_argument("--attr_dim", type=int, default=6)
+    parser.add_argument("--app_dim", type=int, default=5)
+    parser.add_argument("--traffic_dim", type=int, default=6)
+    parser.add_argument("--vehicle_dim", type=int, default=6)
+
+    parser.add_argument("--context_embed_dim", type=int, default=64)
+    parser.add_argument("--context_hidden_dim", type=int, default=64)
+    parser.add_argument("--expert_hidden_dim", type=int, default=128)
+    parser.add_argument("--gate_hidden_dim", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--base_logit_weight", type=float, default=0.85)
-    parser.add_argument("--future_logit_weight", type=float, default=0.15)
+
+    parser.add_argument("--base_logit_weight", type=float, default=0.8)
+    parser.add_argument("--expert_logit_weight", type=float, default=0.2)
 
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr_unfreeze", type=float, default=3e-5)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
 
     parser.add_argument("--lambda_final", type=float, default=1.0)
-    parser.add_argument("--lambda_branch", type=float, default=0.05)
-    parser.add_argument("--lambda_balance", type=float, default=0.01)
-    parser.add_argument("--lambda_div", type=float, default=0.005)
-    parser.add_argument("--lambda_distill", type=float, default=1.0)
+    parser.add_argument("--lambda_branch", type=float, default=0.1)
+    parser.add_argument("--lambda_distill", type=float, default=0.3)
+    parser.add_argument("--lambda_gate_balance", type=float, default=0.01)
+    parser.add_argument("--lambda_div", type=float, default=0.02)
+    parser.add_argument("--lambda_margin", type=float, default=0.01)
+    parser.add_argument("--lambda_risk_reg", type=float, default=0.01)
 
     parser.add_argument("--decision_threshold", type=float, default=0.5)
     parser.add_argument("--dataset_verbose", action="store_true")
     parser.add_argument("--log_interval", type=int, default=50)
 
+    parser.add_argument("--unfreeze_epoch", type=int, default=100)
+    parser.add_argument("--max_pos_weight", type=float, default=10.0)
+
     parser.add_argument(
         "--save_dir",
         type=str,
-        default=r"C:\Users\IIPL02\Desktop\Vision Prediction\checkpoints\multi_future_stage2_basepreserve"
+        default=r"C:\Users\IIPL02\Desktop\Vision Prediction\checkpoints\context_expert_stage2_2branch"
     )
 
     args = parser.parse_args()
@@ -544,8 +609,7 @@ def main():
     full_dataset = build_dataset(dataset_cls, args)
 
     sample0 = full_dataset[0]
-    print(f"[Sample Keys] {list(sample0.keys())}")
-    video_key, label_key = infer_video_and_label_keys(sample0)
+    keys = infer_keys(sample0)
 
     val_size = max(1, int(len(full_dataset) * args.val_ratio))
     train_size = len(full_dataset) - val_size
@@ -560,12 +624,20 @@ def main():
 
     print(f"[Split] train={len(train_set)} | val={len(val_set)}")
 
-    train_pos, train_neg = get_subset_label_stats(train_set, label_key)
-    val_pos, val_neg = get_subset_label_stats(val_set, label_key)
+    train_pos, train_neg = get_subset_label_stats(train_set, keys["label_key"])
+    val_pos, val_neg = get_subset_label_stats(val_set, keys["label_key"])
     print(f"[Train Labels] pos={train_pos}, neg={train_neg}")
     print(f"[Valid Labels] pos={val_pos}, neg={val_neg}")
 
-    train_sampler = build_weighted_sampler(train_set, label_key)
+    dataset_pos_weight = compute_dataset_pos_weight(
+        train_pos,
+        train_neg,
+        max_pos_weight=args.max_pos_weight,
+    )
+    dataset_pos_weight = max(1.0, dataset_pos_weight)
+    print(f"[Loss] dataset_pos_weight={dataset_pos_weight:.4f}")
+
+    train_sampler = build_weighted_sampler(train_set, keys["label_key"])
 
     train_loader = DataLoader(
         train_set,
@@ -587,39 +659,51 @@ def main():
     # --------------------------------------------------------
     # Model
     # --------------------------------------------------------
-    model = MultiFutureStage2Model(
+    model = ContextExpertStage2Model(
         stage1_model=None,
         stage1_feat_dim=args.stage1_feat_dim,
-        adapter_hidden_dim=args.adapter_hidden_dim,
-        future_dim=args.future_dim,
-        shared_hidden_dim=args.shared_hidden_dim,
-        branch_hidden_dim=args.branch_hidden_dim,
-        num_branches=args.num_branches,
+        attr_dim=args.attr_dim,
+        app_dim=args.app_dim,
+        traffic_dim=args.traffic_dim,
+        vehicle_dim=args.vehicle_dim,
+        context_embed_dim=args.context_embed_dim,
+        context_hidden_dim=args.context_hidden_dim,
+        expert_hidden_dim=args.expert_hidden_dim,
+        gate_hidden_dim=args.gate_hidden_dim,
         dropout=args.dropout,
         base_logit_weight=args.base_logit_weight,
-        future_logit_weight=args.future_logit_weight,
+        expert_logit_weight=args.expert_logit_weight,
     ).to(device)
 
     load_stage1_checkpoint(model, args.stage1_ckpt)
 
-    # Warm-up: freeze full stage1
+    # Freeze Stage1 by default
     model.freeze_stage1()
 
     print_trainable_modules(model)
     print(f"[Trainable Params] {count_trainable_params(model):,}")
 
-    optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
+    optimizer = build_optimizer(model, lr=args.lr, weight_decay=args.weight_decay)
 
     csv_path = os.path.join(args.save_dir, "metrics.csv")
     best_val_bal_acc = -1.0
     global_start = time.time()
+    has_unfroze = False
 
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.time()
+
+        if (not has_unfroze) and (epoch >= args.unfreeze_epoch):
+            print("\n" + "=" * 120)
+            print(f"[Stage1 Partial Unfreeze @ Epoch {epoch}]")
+            print("=" * 120)
+
+            model.unfreeze_stage1_temporal_and_head_only()
+            print_trainable_modules(model)
+            print(f"[Trainable Params After Unfreeze] {count_trainable_params(model):,}")
+
+            optimizer = build_optimizer(model, lr=args.lr_unfreeze, weight_decay=args.weight_decay)
+            has_unfroze = True
 
         print("\n" + "=" * 120)
         print(f"[Epoch {epoch:03d}/{args.epochs:03d}] START")
@@ -632,16 +716,18 @@ def main():
             device=device,
             epoch=epoch,
             total_epochs=args.epochs,
-            video_key=video_key,
-            label_key=label_key,
+            keys=keys,
             threshold=args.decision_threshold,
+            pos_weight=dataset_pos_weight,
             log_prefix="Train",
             train_mode=True,
             lambda_final=args.lambda_final,
             lambda_branch=args.lambda_branch,
-            lambda_balance=args.lambda_balance,
-            lambda_div=args.lambda_div,
             lambda_distill=args.lambda_distill,
+            lambda_gate_balance=args.lambda_gate_balance,
+            lambda_div=args.lambda_div,
+            lambda_margin=args.lambda_margin,
+            lambda_risk_reg=args.lambda_risk_reg,
             log_interval=args.log_interval,
         )
 
@@ -652,16 +738,18 @@ def main():
             device=device,
             epoch=epoch,
             total_epochs=args.epochs,
-            video_key=video_key,
-            label_key=label_key,
+            keys=keys,
             threshold=args.decision_threshold,
+            pos_weight=dataset_pos_weight,
             log_prefix="Valid",
             train_mode=False,
             lambda_final=args.lambda_final,
             lambda_branch=args.lambda_branch,
-            lambda_balance=args.lambda_balance,
-            lambda_div=args.lambda_div,
             lambda_distill=args.lambda_distill,
+            lambda_gate_balance=args.lambda_gate_balance,
+            lambda_div=args.lambda_div,
+            lambda_margin=args.lambda_margin,
+            lambda_risk_reg=args.lambda_risk_reg,
             log_interval=args.log_interval,
         )
 
@@ -681,9 +769,11 @@ def main():
             f"[Train] Loss {train_metrics['loss']:.4f} | "
             f"Final {train_metrics['final_loss']:.4f} | "
             f"Branch {train_metrics['branch_loss']:.4f} | "
-            f"Balance {train_metrics['balance_loss']:.4f} | "
-            f"Div {train_metrics['div_loss']:.4f} | "
             f"Distill {train_metrics['distill_loss']:.4f} | "
+            f"GateBal {train_metrics['gate_balance_loss']:.4f} | "
+            f"Div {train_metrics['div_loss']:.4f} | "
+            f"Margin {train_metrics['margin_loss']:.4f} | "
+            f"RiskReg {train_metrics['risk_reg_loss']:.4f} | "
             f"Acc {train_metrics['acc']:.4f} | "
             f"BalAcc {train_metrics['balanced_acc']:.4f} | "
             f"Prec {train_metrics['precision']:.4f} | "
@@ -694,15 +784,18 @@ def main():
             f"FP {train_metrics['fp']} | FN {train_metrics['fn']} | "
             f"BestThr {train_metrics['best_threshold']:.2f} | "
             f"BestThrBalAcc {train_metrics['best_thr_balanced_acc']:.4f} | "
+            f"GateMean {train_metrics['gate_mean']} | "
             f"BranchUsage {train_metrics['branch_usage']}"
         )
         print(
             f"[Valid] Loss {val_metrics['loss']:.4f} | "
             f"Final {val_metrics['final_loss']:.4f} | "
             f"Branch {val_metrics['branch_loss']:.4f} | "
-            f"Balance {val_metrics['balance_loss']:.4f} | "
-            f"Div {val_metrics['div_loss']:.4f} | "
             f"Distill {val_metrics['distill_loss']:.4f} | "
+            f"GateBal {val_metrics['gate_balance_loss']:.4f} | "
+            f"Div {val_metrics['div_loss']:.4f} | "
+            f"Margin {val_metrics['margin_loss']:.4f} | "
+            f"RiskReg {val_metrics['risk_reg_loss']:.4f} | "
             f"Acc {val_metrics['acc']:.4f} | "
             f"BalAcc {val_metrics['balanced_acc']:.4f} | "
             f"Prec {val_metrics['precision']:.4f} | "
@@ -713,6 +806,7 @@ def main():
             f"FP {val_metrics['fp']} | FN {val_metrics['fn']} | "
             f"BestThr {val_metrics['best_threshold']:.2f} | "
             f"BestThrBalAcc {val_metrics['best_thr_balanced_acc']:.4f} | "
+            f"GateMean {val_metrics['gate_mean']} | "
             f"BranchUsage {val_metrics['branch_usage']}"
         )
         print("-" * 120)
@@ -745,9 +839,11 @@ def main():
             "train_loss": round(train_metrics["loss"], 6),
             "train_final_loss": round(train_metrics["final_loss"], 6),
             "train_branch_loss": round(train_metrics["branch_loss"], 6),
-            "train_balance_loss": round(train_metrics["balance_loss"], 6),
-            "train_div_loss": round(train_metrics["div_loss"], 6),
             "train_distill_loss": round(train_metrics["distill_loss"], 6),
+            "train_gate_balance_loss": round(train_metrics["gate_balance_loss"], 6),
+            "train_div_loss": round(train_metrics["div_loss"], 6),
+            "train_margin_loss": round(train_metrics["margin_loss"], 6),
+            "train_risk_reg_loss": round(train_metrics["risk_reg_loss"], 6),
             "train_acc": round(train_metrics["acc"], 6),
             "train_balanced_acc": round(train_metrics["balanced_acc"], 6),
             "train_precision": round(train_metrics["precision"], 6),
@@ -761,14 +857,17 @@ def main():
             "train_best_threshold": round(train_metrics["best_threshold"], 4),
             "train_best_thr_balanced_acc": round(train_metrics["best_thr_balanced_acc"], 6),
             "train_best_thr_f1": round(train_metrics["best_thr_f1"], 6),
+            "train_gate_mean": str(train_metrics["gate_mean"]),
             "train_branch_usage": str(train_metrics["branch_usage"]),
 
             "val_loss": round(val_metrics["loss"], 6),
             "val_final_loss": round(val_metrics["final_loss"], 6),
             "val_branch_loss": round(val_metrics["branch_loss"], 6),
-            "val_balance_loss": round(val_metrics["balance_loss"], 6),
-            "val_div_loss": round(val_metrics["div_loss"], 6),
             "val_distill_loss": round(val_metrics["distill_loss"], 6),
+            "val_gate_balance_loss": round(val_metrics["gate_balance_loss"], 6),
+            "val_div_loss": round(val_metrics["div_loss"], 6),
+            "val_margin_loss": round(val_metrics["margin_loss"], 6),
+            "val_risk_reg_loss": round(val_metrics["risk_reg_loss"], 6),
             "val_acc": round(val_metrics["acc"], 6),
             "val_balanced_acc": round(val_metrics["balanced_acc"], 6),
             "val_precision": round(val_metrics["precision"], 6),
@@ -782,10 +881,11 @@ def main():
             "val_best_threshold": round(val_metrics["best_threshold"], 4),
             "val_best_thr_balanced_acc": round(val_metrics["best_thr_balanced_acc"], 6),
             "val_best_thr_f1": round(val_metrics["best_thr_f1"], 6),
+            "val_gate_mean": str(val_metrics["gate_mean"]),
             "val_branch_usage": str(val_metrics["branch_usage"]),
         }
         append_log_csv(csv_path, row)
-        print(f"[Metrics Logged] {csv_path}")
+        print(f"[Metrics Logged ] {csv_path}")
 
     print("\n" + "=" * 120)
     print(f"[Training Done] Best Val Best-Threshold Balanced Acc = {best_val_bal_acc:.4f}")
