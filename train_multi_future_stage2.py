@@ -62,8 +62,8 @@ def resolve_dataset_class():
     candidates = [
         ("datasets.jaad_crossing_clip_context_dataset", ["JAADCrossingClipContextDataset"]),
         ("jaad_crossing_clip_context_dataset", ["JAADCrossingClipContextDataset"]),
-        ("datasets.jaad_video_dataset", ["JAADVideoDataset"]),  # fallback
-        ("jaad_video_dataset", ["JAADVideoDataset"]),           # fallback
+        ("datasets.jaad_video_dataset", ["JAADVideoDataset"]),   # fallback
+        ("jaad_video_dataset", ["JAADVideoDataset"]),            # fallback
     ]
 
     errors = []
@@ -332,11 +332,11 @@ def run_one_epoch(
     log_prefix="Train",
     train_mode=True,
     lambda_final=1.0,
-    lambda_branch=0.1,
+    lambda_branch=0.3,
     lambda_distill=0.3,
-    lambda_gate_balance=0.01,
-    lambda_div=0.02,
-    lambda_margin=0.01,
+    lambda_gate_balance=0.05,
+    lambda_div=0.10,
+    lambda_margin=0.05,
     lambda_risk_reg=0.01,
     log_interval=50,
 ):
@@ -506,7 +506,7 @@ def main():
     parser.add_argument(
         "--stage1_ckpt",
         type=str,
-        default=r"C:\Users\IIPL02\Desktop\Vision Prediction\checkpoints\temporal_crossing_mamba2scale\best_epoch_002_valF1_0.9670_valAcc_0.9569.pth"
+        default=r"C:\Users\IIPL02\Desktop\Vision Prediction\checkpoints\temporal_crossing\best_epoch_005_valF1_0.9777_valAcc_0.9706.pth"
     )
 
     parser.add_argument(
@@ -566,19 +566,19 @@ def main():
     parser.add_argument("--gate_hidden_dim", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.1)
 
-    parser.add_argument("--base_logit_weight", type=float, default=0.8)
-    parser.add_argument("--expert_logit_weight", type=float, default=0.2)
+    parser.add_argument("--base_logit_weight", type=float, default=0.6)
+    parser.add_argument("--expert_logit_weight", type=float, default=0.4)
 
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--lr_unfreeze", type=float, default=3e-5)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
 
     parser.add_argument("--lambda_final", type=float, default=1.0)
-    parser.add_argument("--lambda_branch", type=float, default=0.1)
+    parser.add_argument("--lambda_branch", type=float, default=0.3)
     parser.add_argument("--lambda_distill", type=float, default=0.3)
-    parser.add_argument("--lambda_gate_balance", type=float, default=0.01)
-    parser.add_argument("--lambda_div", type=float, default=0.02)
-    parser.add_argument("--lambda_margin", type=float, default=0.01)
+    parser.add_argument("--lambda_gate_balance", type=float, default=0.05)
+    parser.add_argument("--lambda_div", type=float, default=0.10)
+    parser.add_argument("--lambda_margin", type=float, default=0.05)
     parser.add_argument("--lambda_risk_reg", type=float, default=0.01)
 
     parser.add_argument("--decision_threshold", type=float, default=0.5)
@@ -634,7 +634,6 @@ def main():
         train_neg,
         max_pos_weight=args.max_pos_weight,
     )
-    dataset_pos_weight = max(1.0, dataset_pos_weight)
     print(f"[Loss] dataset_pos_weight={dataset_pos_weight:.4f}")
 
     train_sampler = build_weighted_sampler(train_set, keys["label_key"])
@@ -662,10 +661,12 @@ def main():
     model = ContextExpertStage2Model(
         stage1_model=None,
         stage1_feat_dim=args.stage1_feat_dim,
+
         attr_dim=args.attr_dim,
         app_dim=args.app_dim,
         traffic_dim=args.traffic_dim,
         vehicle_dim=args.vehicle_dim,
+
         context_embed_dim=args.context_embed_dim,
         context_hidden_dim=args.context_hidden_dim,
         expert_hidden_dim=args.expert_hidden_dim,
@@ -673,6 +674,36 @@ def main():
         dropout=args.dropout,
         base_logit_weight=args.base_logit_weight,
         expert_logit_weight=args.expert_logit_weight,
+
+        # -----------------------------
+        # Stage1 config (must match Stage1 training)
+        # -----------------------------
+        backbone_name="convnextv2_tiny.fcmae_ft_in22k_in1k",
+        backbone_dim=768,
+        freeze_backbone=True,
+
+        frame_feature_dim=768,
+        frame_encoder_num_heads=8,
+        frame_encoder_num_layers=2,
+        frame_encoder_ff_dim=1536,
+        frame_encoder_dropout=0.1,
+        frame_encoder_use_volterra=True,
+        frame_encoder_volterra_rank=16,
+        frame_encoder_volterra_alpha=1.0,
+
+        temporal_encoder_type="mamba_2scale",
+        temporal_mamba_dim=768,
+        temporal_mamba_num_layers=2,
+        temporal_mamba_state_dim=16,
+        temporal_mamba_conv_kernel=4,
+        temporal_mamba_expand=2,
+        temporal_mamba_dropout=0.1,
+        temporal_mamba_fusion="concat_proj",
+        temporal_mamba_local_window=4,
+        temporal_pooling="last",
+
+        event_hidden_dim=256,
+        event_dropout=0.1,
     ).to(device)
 
     load_stage1_checkpoint(model, args.stage1_ckpt)
@@ -885,7 +916,7 @@ def main():
             "val_branch_usage": str(val_metrics["branch_usage"]),
         }
         append_log_csv(csv_path, row)
-        print(f"[Metrics Logged ] {csv_path}")
+        print(f"[Metrics Logged] {csv_path}")
 
     print("\n" + "=" * 120)
     print(f"[Training Done] Best Val Best-Threshold Balanced Acc = {best_val_bal_acc:.4f}")

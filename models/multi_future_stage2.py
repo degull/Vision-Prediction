@@ -179,11 +179,68 @@ class ContextExpertStage2Model(nn.Module):
 
         base_logit_weight: float = 0.6,
         expert_logit_weight: float = 0.4,
+
+        # ----------------------------------------------------
+        # Stage1 config (must match train_temporal_event.py)
+        # ----------------------------------------------------
+        backbone_name: str = "convnextv2_tiny.fcmae_ft_in22k_in1k",
+        backbone_dim: int = 768,
+        freeze_backbone: bool = True,
+
+        frame_feature_dim: int = 768,
+        frame_encoder_num_heads: int = 8,
+        frame_encoder_num_layers: int = 2,
+        frame_encoder_ff_dim: int = 1536,
+        frame_encoder_dropout: float = 0.1,
+        frame_encoder_use_volterra: bool = True,
+        frame_encoder_volterra_rank: int = 16,
+        frame_encoder_volterra_alpha: float = 1.0,
+
+        temporal_encoder_type: str = "mamba_2scale",
+        temporal_mamba_dim: int = 768,
+        temporal_mamba_num_layers: int = 2,
+        temporal_mamba_state_dim: int = 16,
+        temporal_mamba_conv_kernel: int = 4,
+        temporal_mamba_expand: int = 2,
+        temporal_mamba_dropout: float = 0.1,
+        temporal_mamba_fusion: str = "concat_proj",
+        temporal_mamba_local_window: int = 4,
+        temporal_pooling: str = "last",
+
+        event_hidden_dim: int = 256,
+        event_dropout: float = 0.1,
     ):
         super().__init__()
 
         if stage1_model is None:
-            stage1_model = TemporalEventModel()
+            stage1_model = TemporalEventModel(
+                backbone_name=backbone_name,
+                backbone_dim=backbone_dim,
+                freeze_backbone=freeze_backbone,
+
+                frame_feature_dim=frame_feature_dim,
+                frame_encoder_num_heads=frame_encoder_num_heads,
+                frame_encoder_num_layers=frame_encoder_num_layers,
+                frame_encoder_ff_dim=frame_encoder_ff_dim,
+                frame_encoder_dropout=frame_encoder_dropout,
+                frame_encoder_use_volterra=frame_encoder_use_volterra,
+                frame_encoder_volterra_rank=frame_encoder_volterra_rank,
+                frame_encoder_volterra_alpha=frame_encoder_volterra_alpha,
+
+                temporal_encoder_type=temporal_encoder_type,
+                temporal_mamba_dim=temporal_mamba_dim,
+                temporal_mamba_num_layers=temporal_mamba_num_layers,
+                temporal_mamba_state_dim=temporal_mamba_state_dim,
+                temporal_mamba_conv_kernel=temporal_mamba_conv_kernel,
+                temporal_mamba_expand=temporal_mamba_expand,
+                temporal_mamba_dropout=temporal_mamba_dropout,
+                temporal_mamba_fusion=temporal_mamba_fusion,
+                temporal_mamba_local_window=temporal_mamba_local_window,
+                temporal_pooling=temporal_pooling,
+
+                event_hidden_dim=event_hidden_dim,
+                event_dropout=event_dropout,
+            )
 
         self.stage1_model = stage1_model
         self.stage1_feat_dim = stage1_feat_dim
@@ -198,6 +255,33 @@ class ContextExpertStage2Model(nn.Module):
 
         self.base_logit_weight = float(base_logit_weight)
         self.expert_logit_weight = float(expert_logit_weight)
+
+        # keep config for debugging / reproducibility
+        self.stage1_config = {
+            "backbone_name": backbone_name,
+            "backbone_dim": backbone_dim,
+            "freeze_backbone": freeze_backbone,
+            "frame_feature_dim": frame_feature_dim,
+            "frame_encoder_num_heads": frame_encoder_num_heads,
+            "frame_encoder_num_layers": frame_encoder_num_layers,
+            "frame_encoder_ff_dim": frame_encoder_ff_dim,
+            "frame_encoder_dropout": frame_encoder_dropout,
+            "frame_encoder_use_volterra": frame_encoder_use_volterra,
+            "frame_encoder_volterra_rank": frame_encoder_volterra_rank,
+            "frame_encoder_volterra_alpha": frame_encoder_volterra_alpha,
+            "temporal_encoder_type": temporal_encoder_type,
+            "temporal_mamba_dim": temporal_mamba_dim,
+            "temporal_mamba_num_layers": temporal_mamba_num_layers,
+            "temporal_mamba_state_dim": temporal_mamba_state_dim,
+            "temporal_mamba_conv_kernel": temporal_mamba_conv_kernel,
+            "temporal_mamba_expand": temporal_mamba_expand,
+            "temporal_mamba_dropout": temporal_mamba_dropout,
+            "temporal_mamba_fusion": temporal_mamba_fusion,
+            "temporal_mamba_local_window": temporal_mamba_local_window,
+            "temporal_pooling": temporal_pooling,
+            "event_hidden_dim": event_hidden_dim,
+            "event_dropout": event_dropout,
+        }
 
         # ----------------------------------------------------
         # Context encoders
@@ -387,6 +471,7 @@ def binary_bce_with_logits(logits, labels, pos_weight=None, sample_weight=None):
 
     return loss.mean()
 
+
 def final_classification_loss(final_logit, labels, pos_weight=None, sample_weight=None):
     return binary_bce_with_logits(
         final_logit, labels, pos_weight=pos_weight, sample_weight=sample_weight
@@ -529,7 +614,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = ContextExpertStage2Model(
-        stage1_model=TemporalEventModel(),
+        stage1_model=None,
         stage1_feat_dim=768,
         attr_dim=6,
         app_dim=5,
@@ -542,6 +627,33 @@ if __name__ == "__main__":
         dropout=0.1,
         base_logit_weight=0.6,
         expert_logit_weight=0.4,
+
+        backbone_name="convnextv2_tiny.fcmae_ft_in22k_in1k",
+        backbone_dim=768,
+        freeze_backbone=True,
+
+        frame_feature_dim=768,
+        frame_encoder_num_heads=8,
+        frame_encoder_num_layers=2,
+        frame_encoder_ff_dim=1536,
+        frame_encoder_dropout=0.1,
+        frame_encoder_use_volterra=True,
+        frame_encoder_volterra_rank=16,
+        frame_encoder_volterra_alpha=1.0,
+
+        temporal_encoder_type="mamba_2scale",
+        temporal_mamba_dim=768,
+        temporal_mamba_num_layers=2,
+        temporal_mamba_state_dim=16,
+        temporal_mamba_conv_kernel=4,
+        temporal_mamba_expand=2,
+        temporal_mamba_dropout=0.1,
+        temporal_mamba_fusion="concat_proj",
+        temporal_mamba_local_window=4,
+        temporal_pooling="last",
+
+        event_hidden_dim=256,
+        event_dropout=0.1,
     ).to(device)
 
     model.freeze_stage1()
@@ -565,3 +677,4 @@ if __name__ == "__main__":
     print("final_logit           :", tuple(out["final_logit"].shape))
     print("loss_total            :", float(losses["total"].item()))
     print("trainable_params      :", count_trainable_params(model))
+    print("stage1_config         :", model.stage1_config)
