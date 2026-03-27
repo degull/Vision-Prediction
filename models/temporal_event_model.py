@@ -1,4 +1,5 @@
 # C:\Users\IIPL02\Desktop\Vision Prediction\models\temporal_event_model.py
+# stage 1 model: backbone + frame encoder + temporal encoder + event head
 from typing import Dict, Optional
 
 import torch

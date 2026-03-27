@@ -1,4 +1,4 @@
-# 2. Temporal Encoder 단계
+# Stage 1
 # C:\Users\IIPL02\Desktop\Vision Prediction\train_temporal_event.py
 # Spatial Backbone + Transformer+Volterra Frame Encoder + 2-Scale Temporal Mamba Encoder
 import os
